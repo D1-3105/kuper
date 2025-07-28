@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"kuper/pkg/etcd_utils"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -26,6 +27,10 @@ type Entry struct {
 	Hash    *string      `json:"hash,omitempty"`
 	Version *string      `json:"version,omitempty"`
 	Type    DirEntryType `json:"type,omitempty"`
+}
+
+func (e *Entry) SetDirMeta(dmeta *DirMeta) {
+	e.dmeta = dmeta
 }
 
 // GetTorrentMeta - if it's a file - return associated torrent metadata for libtorrent (.torrent content)
@@ -50,8 +55,7 @@ func (e *Entry) GetTorrentMeta(ctx context.Context, etcdClient *clientv3.Client)
 	if torrentMetas.Count == 0 {
 		return nil, errors.New("no torrent meta found")
 	}
-	err = json.Unmarshal(torrentMetas.Kvs[torrentMetas.Count].Value, torrentMeta)
-	if err != nil {
+	if err = json.Unmarshal(torrentMetas.Kvs[torrentMetas.Count-1].Value, torrentMeta); err != nil {
 		return nil, err
 	}
 	torrentMeta.entry = *e
@@ -74,7 +78,7 @@ func (e *Entry) LockPath() (string, error) {
 // AtomicOp callMe with locked entry
 func (e *Entry) AtomicOp(
 	ctx context.Context,
-	callMe func(context.Context, *concurrency.Session) error,
+	callMe func(context.Context, etcd_utils.ETCDSession) error,
 	etcdClient *clientv3.Client,
 	ttl uint16,
 ) error {
@@ -86,7 +90,8 @@ func (e *Entry) AtomicOp(
 	sessionCtx, cancelSession := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
 	defer cancelSession()
 
-	session, err := concurrency.NewSession(etcdClient,
+	session, err := ETCDSessionFactory(
+		etcdClient,
 		concurrency.WithTTL(int(ttl)),
 		concurrency.WithContext(sessionCtx),
 	)
@@ -99,7 +104,7 @@ func (e *Entry) AtomicOp(
 		}
 	}()
 
-	mu := concurrency.NewMutex(session, lockPath)
+	mu := ETCDMutexFactory(session, lockPath)
 
 	lockCtx, cancelLock := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelLock()
@@ -114,4 +119,63 @@ func (e *Entry) AtomicOp(
 	}()
 
 	return callMe(ctx, session)
+}
+
+// ToMeta - if Entry is directory - return DirMeta
+func (e *Entry) ToMeta() (*DirMeta, error) {
+	path, err := e.EtcdFullPath()
+	if err != nil {
+		return nil, err
+	}
+	if e.Type != Directory {
+		return nil, fmt.Errorf("entry %s is not a directory", path)
+	}
+	return &DirMeta{path, e.dmeta.VolumeName}, nil
+}
+
+// Delete delete entry
+func (e *Entry) Delete(ctx context.Context, etcdClient *clientv3.Client) error {
+	if e.dmeta == nil {
+		return fmt.Errorf("{%v}.dmeta == nil", e)
+	}
+	deleteEntry := func(ctx context.Context, _ etcd_utils.ETCDSession) error {
+		onDel, err := e.EtcdFullPath()
+		if err != nil {
+			return err
+		}
+
+		if err != nil {
+			return err
+		}
+		switch e.Type {
+		case Keep:
+			_, err = etcdClient.Delete(ctx, onDel)
+			return err
+		case Directory:
+			meta, err := e.ToMeta()
+			if err != nil {
+				return err
+			}
+
+			if err := meta.Delete(ctx, etcdClient); err != nil {
+				return err
+			}
+			_, err = etcdClient.Delete(ctx, onDel)
+			return err
+		case File:
+			if _, err = etcdClient.Delete(
+				ctx, fmt.Sprintf(TorrentMetaEndpoint, e.dmeta.VolumeName, e.dmeta.Name),
+			); err != nil {
+				return err
+			}
+			if _, err = etcdClient.Delete(ctx, onDel); err != nil {
+				return err
+			}
+		}
+		return err
+	}
+	withDmetaLock := func(ctx context.Context, _ etcd_utils.ETCDSession) error {
+		return e.AtomicOp(ctx, deleteEntry, etcdClient, 1000)
+	}
+	return e.dmeta.AtomicOp(ctx, withDmetaLock, etcdClient, 1000)
 }

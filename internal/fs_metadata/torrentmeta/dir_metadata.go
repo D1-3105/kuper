@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"kuper/pkg/etcd_utils"
 	"time"
 
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -36,7 +37,7 @@ func (dmeta *DirMeta) LockPath() (string, error) {
 // AtomicOp - atomic op for current DirMeta object
 func (dmeta *DirMeta) AtomicOp(
 	ctx context.Context,
-	callMe func(context.Context, *concurrency.Session) error,
+	callMe func(context.Context, etcd_utils.ETCDSession) error,
 	etcdClient *clientv3.Client,
 	ttl uint16,
 ) error {
@@ -48,7 +49,7 @@ func (dmeta *DirMeta) AtomicOp(
 	sessionCtx, cancelSession := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
 	defer cancelSession()
 
-	session, err := concurrency.NewSession(
+	session, err := ETCDSessionFactory(
 		etcdClient,
 		concurrency.WithTTL(int(ttl)),
 		concurrency.WithContext(sessionCtx),
@@ -62,7 +63,7 @@ func (dmeta *DirMeta) AtomicOp(
 		}
 	}()
 
-	mu := concurrency.NewMutex(session, lockPath)
+	mu := ETCDMutexFactory(session, lockPath)
 
 	lockCtx, cancelLock := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelLock()
@@ -83,7 +84,7 @@ func (dmeta *DirMeta) AtomicOp(
 func (dmeta *DirMeta) Touch(ctx context.Context, etcdClient *clientv3.Client) error {
 	keepEtcd := Entry{dmeta: dmeta, Name: "keep", Size: 0, Hash: nil, Version: nil, Type: Keep}
 
-	putKeep := func(ctx context.Context, _ *concurrency.Session) error {
+	putKeep := func(ctx context.Context, _ etcd_utils.ETCDSession) error {
 		fp, err := keepEtcd.EtcdFullPath()
 		if err != nil {
 			return err
@@ -95,7 +96,7 @@ func (dmeta *DirMeta) Touch(ctx context.Context, etcdClient *clientv3.Client) er
 		_, err = etcdClient.Put(ctx, fp, string(marshalled))
 		return err
 	}
-	withLockDirMeta := func(ctx context.Context, _ *concurrency.Session) error {
+	withLockDirMeta := func(ctx context.Context, _ etcd_utils.ETCDSession) error {
 		return keepEtcd.AtomicOp(ctx, putKeep, etcdClient, 15)
 	}
 	return dmeta.AtomicOp(ctx, withLockDirMeta, etcdClient, 15)
@@ -130,6 +131,24 @@ func (dmeta *DirMeta) GetEntries(
 			continue
 		}
 		entry.dmeta = dmeta
+		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// Delete is non-atomic delete, because sub-entries lock dmeta
+func (dmeta *DirMeta) Delete(ctx context.Context, etcdClient *clientv3.Client) error {
+	entries, err := dmeta.GetEntries(ctx, etcdClient, nil)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		err = entry.Delete(ctx, etcdClient)
+		if err != nil {
+			return err
+		}
+	}
+	metaKey := fmt.Sprintf(TorrentMetaEndpoint, dmeta.VolumeName, dmeta.Name)
+	_, err = etcdClient.Delete(ctx, metaKey)
+	return err
 }
